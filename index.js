@@ -3,9 +3,13 @@
 // Relevo: Victoria atiende mientras la conversacion esta "pending".
 // Si el cliente pide una persona (o el caso lo requiere), pasa a "open"
 // (entra el humano). Al volver a "pending", Victoria retoma con su memoria.
+//
+// CALCULO DE ITP: Victoria NO calcula a ojo. Cuando tiene los datos, llama a la
+// herramienta determinista calcular_itp (motor itp-engine.js) y da la cifra exacta.
 
 import express from "express";
 import Anthropic from "@anthropic-ai/sdk";
+import { calcularITP } from "./itp-engine.js";
 
 const {
   PORT = 3000,
@@ -29,6 +33,7 @@ TONO Y ESTILO
 - Mensajes breves y claros, como en un chat de WhatsApp. Nada de parrafos largos ni tecnicismos.
 - Explicas las cosas de forma sencilla, como a alguien sin conocimientos.
 - Transmites seguridad y confianza.
+- Vas paso a paso y pides los datos de UNO EN UNO. Nunca pidas varias cosas a la vez.
 - IMPORTANTE: solo te presentas ("Soy Victoria...") en tu PRIMER mensaje de la conversacion.
   Despues NO vuelvas a presentarte; continua la conversacion de forma natural.
 
@@ -43,15 +48,30 @@ PRESUPUESTO
 - El precio se compone de: tasas DGT + honorarios + ITP (si aplica) + 21% IVA solo sobre honorarios.
 - NO te inventes cifras de tasas, honorarios ni ITP. Si no tienes el dato exacto, dilo con
   naturalidad y explica que preparas el presupuesto cerrado y se lo confirmas enseguida.
-- Para una transferencia, pide: tipo de vehiculo, matricula o marca/modelo y ano, si comprador
-  y vendedor son particulares o empresa, y la provincia.
+
+CALCULO DE ITP (cambio de titularidad entre particulares)
+- El ITP es el impuesto autonomico que paga el COMPRADOR al cambiar la titularidad de un
+  vehiculo usado comprado a un particular. Es independiente de tasas DGT y honorarios.
+- NUNCA calcules el ITP de cabeza ni te inventes el tipo de la comunidad. Para darlo, usa
+  SIEMPRE la herramienta "calcular_itp".
+- Datos minimos que necesitas (pidelos de UNO EN UNO, de forma natural):
+  1) la PROVINCIA donde vive el comprador (el ITP depende de su comunidad autonoma),
+  2) el PRECIO de compraventa acordado.
+  (Si el cliente te dice tambien la fecha de matriculacion, pasala; no es imprescindible ahora.)
+- Cuando tengas precio y provincia, llama a calcular_itp. Despues comunica el importe de forma
+  clara y calida, e incluye SIEMPRE los avisos que devuelva la herramienta (campo "avisos"):
+  es una estimacion del ITP y el gestor colegiado confirma el importe exacto.
+- Si la herramienta devuelve un error (provincia no reconocida, falta de datos, Ceuta/Melilla),
+  pide con naturalidad el dato que falte o di que lo confirma el gestor.
+- Recuerda que el ITP es solo una parte: si procede, suma que ademas van las tasas de la DGT y
+  los honorarios de la gestoria (esas cifras las confirma el gestor / el presupuesto cerrado).
 
 LIMITES
 - Eres asistente, no la gestora. Para precios exactos, casos complejos o dudas legales delicadas,
   indica que lo revisa el gestor colegiado.
 - No prometas plazos concretos de la DGT si no los tienes; habla de plazos orientativos.
 - De momento NO pidas documentos, pagos ni firmas (eso llega en una fase posterior). Tu papel
-  ahora es atender, informar y recoger datos para el presupuesto.
+  ahora es atender, informar, calcular el ITP orientativo y recoger datos para el presupuesto.
 
 RELEVO A HUMANO (IMPORTANTE)
 - Si el cliente pide expresamente hablar con una persona / un agente / Sergio, o el caso necesita
@@ -59,9 +79,50 @@ RELEVO A HUMANO (IMPORTANTE)
   y a continuacion, en una linea aparte, escribe exactamente: [[HANDOFF]]
 - No escribas [[HANDOFF]] en ningun otro caso.`;
 
+// ---------- Herramientas (tool-use) ----------
+const TOOLS = [
+  {
+    name: "calcular_itp",
+    description:
+      "Calcula el ITP (Impuesto de Transmisiones Patrimoniales, Modelo 620) de un vehiculo " +
+      "usado en una compraventa entre particulares. Devuelve el importe, el tipo aplicado y " +
+      "avisos. Usalo SOLO cuando tengas el precio de venta y la provincia/comunidad del COMPRADOR.",
+    input_schema: {
+      type: "object",
+      properties: {
+        precioVenta: {
+          type: "number",
+          description: "Precio de compraventa acordado, en euros.",
+        },
+        ubicacion: {
+          type: "string",
+          description:
+            "Provincia o comunidad autonoma donde RESIDE el comprador (ej: 'Malaga', 'Madrid', 'Barcelona').",
+        },
+        fechaPrimeraMatriculacion: {
+          type: "string",
+          description: "Opcional. Fecha de 1a matriculacion en formato AAAA-MM-DD, si se conoce.",
+        },
+      },
+      required: ["precioVenta", "ubicacion"],
+    },
+  },
+];
+
+function ejecutarHerramienta(nombre, input) {
+  if (nombre === "calcular_itp") {
+    try {
+      return calcularITP(input || {});
+    } catch (e) {
+      return { ok: false, error: String(e && e.message ? e.message : e) };
+    }
+  }
+  return { ok: false, error: `Herramienta desconocida: ${nombre}` };
+}
+
 // ---------- Memoria de conversacion (en RAM, por conversation_id) ----------
 // Los bots de Chatwoot NO pueden leer el historial por API (401), asi que
-// Victoria lleva su propia memoria de cada conversacion.
+// Victoria lleva su propia memoria de cada conversacion (solo texto).
 const HISTORY = new Map();        // conversationId -> [{role, content}]
 const MAX_TURNS = 24;
 
@@ -119,19 +180,51 @@ async function handoffToHuman(accountId, conversationId) {
   if (!res.ok) console.error("Error en handoff:", res.status, await res.text());
 }
 
-// ---------- Cerebro: Claude ----------
+// ---------- Cerebro: Claude (con herramientas) ----------
+// Mantiene la memoria persistida solo como texto; el bucle de tool-use vive aqui.
 async function askClaude(history) {
-  const msg = await anthropic.messages.create({
-    model: CLAUDE_MODEL,
-    max_tokens: 600,
-    system: SYSTEM_PROMPT,
-    messages: history.length ? history : [{ role: "user", content: "Hola" }],
-  });
-  return msg.content
-    .filter((b) => b.type === "text")
-    .map((b) => b.text)
-    .join("\n")
-    .trim();
+  const messages = (history.length ? history : [{ role: "user", content: "Hola" }]).map((m) => ({
+    role: m.role,
+    content: m.content,
+  }));
+
+  for (let paso = 0; paso < 5; paso++) {
+    const msg = await anthropic.messages.create({
+      model: CLAUDE_MODEL,
+      max_tokens: 700,
+      system: SYSTEM_PROMPT,
+      tools: TOOLS,
+      messages,
+    });
+
+    if (msg.stop_reason === "tool_use") {
+      // Añade el turno del asistente (con los bloques tool_use) y resuelve cada herramienta.
+      messages.push({ role: "assistant", content: msg.content });
+      const toolResults = [];
+      for (const block of msg.content) {
+        if (block.type === "tool_use") {
+          const resultado = ejecutarHerramienta(block.name, block.input);
+          console.log(`Herramienta ${block.name}(${JSON.stringify(block.input)}) ->`, JSON.stringify(resultado));
+          toolResults.push({
+            type: "tool_result",
+            tool_use_id: block.id,
+            content: JSON.stringify(resultado),
+          });
+        }
+      }
+      messages.push({ role: "user", content: toolResults });
+      continue; // vuelve a llamar a Claude con el resultado de la herramienta
+    }
+
+    // Respuesta final de texto
+    return msg.content
+      .filter((b) => b.type === "text")
+      .map((b) => b.text)
+      .join("\n")
+      .trim();
+  }
+
+  return ""; // por seguridad, si se agotan los pasos
 }
 
 // ---------- Webhook de Chatwoot ----------
