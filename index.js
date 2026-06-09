@@ -1,18 +1,17 @@
 // Victoria - agent-bot de IA para Chatwoot (gestoria TransferenciaDGT)
 // Recibe eventos de Chatwoot por webhook, llama a Claude y responde.
 // Relevo: Victoria atiende mientras la conversacion esta "pending".
-// Si el cliente pide hablar con una persona (o el caso lo requiere),
-// pasa la conversacion a "open" (entra Sergio). Cuando Sergio la deja
-// otra vez en "pending", Victoria retoma con todo el historial.
+// Si el cliente pide una persona (o el caso lo requiere), pasa a "open"
+// (entra el humano). Al volver a "pending", Victoria retoma con su memoria.
 
 import express from "express";
 import Anthropic from "@anthropic-ai/sdk";
 
 const {
   PORT = 3000,
-  CHATWOOT_BASE_URL,          // p.ej. https://victoria-chatwoot.veddzh.easypanel.host
-  CHATWOOT_BOT_TOKEN,         // access token del Agent Bot (lo da Chatwoot al crearlo)
-  ANTHROPIC_API_KEY,          // clave de Claude
+  CHATWOOT_BASE_URL,
+  CHATWOOT_BOT_TOKEN,
+  ANTHROPIC_API_KEY,
   CLAUDE_MODEL = "claude-sonnet-4-6",
 } = process.env;
 
@@ -30,6 +29,8 @@ TONO Y ESTILO
 - Mensajes breves y claros, como en un chat de WhatsApp. Nada de parrafos largos ni tecnicismos.
 - Explicas las cosas de forma sencilla, como a alguien sin conocimientos.
 - Transmites seguridad y confianza.
+- IMPORTANTE: solo te presentas ("Soy Victoria...") en tu PRIMER mensaje de la conversacion.
+  Despues NO vuelvas a presentarte; continua la conversacion de forma natural.
 
 OBJETIVO
 - Recibir al cliente, entender que tramite necesita y resolver sus dudas.
@@ -58,27 +59,44 @@ RELEVO A HUMANO (IMPORTANTE)
   y a continuacion, en una linea aparte, escribe exactamente: [[HANDOFF]]
 - No escribas [[HANDOFF]] en ningun otro caso.`;
 
+// ---------- Memoria de conversacion (en RAM, por conversation_id) ----------
+// Los bots de Chatwoot NO pueden leer el historial por API (401), asi que
+// Victoria lleva su propia memoria de cada conversacion.
+const HISTORY = new Map();        // conversationId -> [{role, content}]
+const MAX_TURNS = 24;
+
+function normalizeType(t) {
+  if (t === 0 || t === "incoming" || t === "0") return "user";
+  if (t === 1 || t === "outgoing" || t === "1") return "assistant";
+  return null; // notas, actividades, plantillas...
+}
+
+function getMem(conversationId) {
+  if (!HISTORY.has(conversationId)) HISTORY.set(conversationId, []);
+  return HISTORY.get(conversationId);
+}
+
+function pushMem(conversationId, role, content) {
+  const h = getMem(conversationId);
+  const last = h[h.length - 1];
+  if (last && last.role === role && last.content === content) return; // evita duplicados
+  h.push({ role, content });
+  while (h.length > MAX_TURNS) h.shift();
+}
+
+function seedFromPayload(conversationId, conversation) {
+  const h = getMem(conversationId);
+  if (h.length > 0) return;
+  const msgs = conversation && Array.isArray(conversation.messages) ? conversation.messages : [];
+  for (const m of msgs) {
+    const role = normalizeType(m.message_type);
+    if (role && m.content && !m.private) pushMem(conversationId, role, String(m.content));
+  }
+}
+
 // ---------- Utilidades Chatwoot ----------
 function cwHeaders() {
   return { "Content-Type": "application/json", api_access_token: CHATWOOT_BOT_TOKEN };
-}
-
-async function getHistory(accountId, conversationId) {
-  const url = `${CHATWOOT_BASE_URL}/api/v1/accounts/${accountId}/conversations/${conversationId}/messages`;
-  const res = await fetch(url, { headers: cwHeaders() });
-  if (!res.ok) {
-    console.error("Error leyendo historial:", res.status, await res.text());
-    return [];
-  }
-  const data = await res.json();
-  const payload = data.payload || data.data?.payload || [];
-  // message_type: 0=incoming(cliente), 1=outgoing(victoria/agente). Ignoramos notas/actividades.
-  const msgs = payload
-    .filter((m) => (m.message_type === 0 || m.message_type === 1) && m.content && !m.private)
-    .sort((a, b) => (a.created_at || 0) - (b.created_at || 0))
-    .slice(-20)
-    .map((m) => ({ role: m.message_type === 0 ? "user" : "assistant", content: String(m.content) }));
-  return msgs;
 }
 
 async function sendReply(accountId, conversationId, content) {
@@ -118,7 +136,7 @@ async function askClaude(history) {
 
 // ---------- Webhook de Chatwoot ----------
 app.post("/", (req, res) => {
-  res.sendStatus(200); // responder rapido; procesamos en segundo plano
+  res.sendStatus(200);
   handleEvent(req.body).catch((e) => console.error("Error en handleEvent:", e));
 });
 app.post("/webhook", (req, res) => {
@@ -127,8 +145,7 @@ app.post("/webhook", (req, res) => {
 });
 
 async function handleEvent(body = {}) {
-  const event = body.event;
-  if (event !== "message_created") return;            // solo mensajes nuevos
+  if (body.event !== "message_created") return;       // solo mensajes nuevos
   if (body.message_type !== "incoming") return;        // solo lo que escribe el cliente
 
   const accountId = body.account?.id;
@@ -137,25 +154,35 @@ async function handleEvent(body = {}) {
   const status = conversation.status; // 'pending' = Victoria al mando; 'open' = humano
   if (!accountId || !conversationId) return;
 
+  const text = body.content;
+  if (!text) return;
+
   // Victoria solo responde si la conversacion esta en manos del bot (pending).
   if (status && status !== "pending") {
-    console.log(`Conversacion ${conversationId} en estado '${status}': Victoria no responde (humano al mando).`);
+    console.log(`Conversacion ${conversationId} en estado '${status}': Victoria calla (humano al mando).`);
+    seedFromPayload(conversationId, conversation);
+    pushMem(conversationId, "user", text); // guarda contexto para cuando retome
     return;
   }
 
-  const history = await getHistory(accountId, conversationId);
+  seedFromPayload(conversationId, conversation);
+  pushMem(conversationId, "user", text);
+  const history = getMem(conversationId);
+
   let reply = await askClaude(history);
   if (!reply) reply = "Perdona, no te he entendido bien. Me lo cuentas otra vez?";
 
   if (reply.includes("[[HANDOFF]]")) {
     reply = reply.replace(/\[\[HANDOFF\]\]/g, "").trim() ||
       "Te paso ahora mismo con un companero del equipo. Un momento, por favor.";
+    pushMem(conversationId, "assistant", reply);
     await sendReply(accountId, conversationId, reply);
     await handoffToHuman(accountId, conversationId);
     console.log(`Conversacion ${conversationId}: relevo a humano.`);
     return;
   }
 
+  pushMem(conversationId, "assistant", reply);
   await sendReply(accountId, conversationId, reply);
 }
 
