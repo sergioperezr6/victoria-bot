@@ -197,4 +197,69 @@ function calcularITP({ precioVenta, ubicacion, valorReferencia = null, precioMed
   };
 }
 
-export { buscarVehiculo, calcularITP, calcularValorFiscal, aniosUtilizacion, porcentajeDepreciacion, resolverCCAA, ITP_CCAA, DEPRECIACION };
+// ============================================================================
+// PRESUPUESTO DEFINITIVO DE TRANSFERENCIA  (tarifas confirmadas, Manual V4.4)
+// ----------------------------------------------------------------------------
+// La via depende de QUIEN VENDE:
+//   A = vendedor profesional con factura (lleva IVA en factura -> SIN ITP)
+//   B = particular a particular (con ITP)
+//   C = asesoria / aseguradora colaboradora (con ITP)
+// Vias A y C exigen prueba de la condicion (factura / acuerdo de colaboracion).
+// Importes con IVA incluido. Cero invencion: si falta un dato, se pide o lo ve el gestor.
+const TARIFA_TRANSFERENCIA = {
+  A: {
+    base: 100, llevaITP: false,
+    etiqueta: "Vía A · vendedor profesional con factura",
+    desglose: ["Servicio completo: 100 € (honorarios + IVA + tasas DGT, todo incluido)",
+               "Sin ITP: al comprar a un profesional, el IVA va en su factura"],
+  },
+  B: {
+    base: 146.45, llevaITP: true,
+    etiqueta: "Vía B · particular a particular",
+    desglose: ["Honorarios: 75 € + IVA (21%) 15,75 € = 90,75 €",
+               "Tasa DGT (tasa oficial de Tráfico): 55,70 €"],
+  },
+  C: {
+    base: 105, llevaITP: true,
+    etiqueta: "Vía C · asesoría o aseguradora colaboradora",
+    desglose: ["Servicio: 105 € (honorarios + IVA + tasa DGT, todo incluido)"],
+  },
+};
+
+// Calcula el presupuesto definitivo de la transferencia: base de la via + ITP.
+// Para B y C calcula el ITP internamente (necesita valorReferencia/fecha/ubicacion/precioVenta).
+function presupuestoTransferencia({ via, valorReferencia = null, fechaPrimeraMatriculacion = null, ubicacion = null, precioVenta = null, usoEspecial = false } = {}) {
+  const key = String(via || "").trim().toUpperCase();
+  const t = TARIFA_TRANSFERENCIA[key];
+  if (!t) return { ok: false, error: `Vía no válida: "${via}". Debe ser A (profesional con factura), B (particular) o C (asesoría/aseguradora).` };
+
+  const desglose = [...t.desglose];
+  let importeITP = 0;
+  const avisos = [];
+  let itpDetalle = null;
+
+  if (t.llevaITP) {
+    const r = calcularITP({ valorReferencia, fechaPrimeraMatriculacion, ubicacion, precioVenta, usoEspecial });
+    if (!r.ok) return r; // falta provincia o precio, o CCAA no válida -> Victoria pide el dato
+    importeITP = r.importeITP;
+    itpDetalle = r;
+    (r.avisos || []).forEach((a) => avisos.push(a));
+    desglose.push(`ITP (impuesto autonómico que paga el comprador): ${importeITP} €`);
+  }
+
+  const total = Math.round((t.base + importeITP) * 100) / 100;
+  return {
+    ok: true,
+    via: key,
+    etiqueta: t.etiqueta,
+    baseServicio: t.base,
+    importeITP,
+    total,
+    desglose,
+    itp: itpDetalle,
+    avisos,
+    nota: "Honorarios = nuestro trabajo; tasa DGT = tasa oficial de Tráfico; ITP = impuesto que pagas como comprador. El gestor confirma el importe final.",
+  };
+}
+
+export { buscarVehiculo, calcularITP, presupuestoTransferencia, calcularValorFiscal, aniosUtilizacion, porcentajeDepreciacion, resolverCCAA, ITP_CCAA, DEPRECIACION, TARIFA_TRANSFERENCIA };
